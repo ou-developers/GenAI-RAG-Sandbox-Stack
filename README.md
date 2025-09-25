@@ -13,7 +13,7 @@ A one-click **OCI Resource Manager** (ORM) stack that provisions a minimal envir
 
 ## Deploy with One Click
 
-[![Deploy to Oracle Cloud](https://oci-resourcemanager-plugin.plugins.oci.oraclecloud.com/latest/deploy-to-oracle-cloud.svg)](https://cloud.oracle.com/resourcemanager/stacks/create?zipUrl=https://github.com/SaurabhOCI/genai-rag-stack/archive/refs/heads/main.zip)
+[![Deploy to Oracle Cloud](https://oci-resourcemanager-plugin.plugins.oci.oraclecloud.com/latest/deploy-to-oracle-cloud.svg)](https://cloud.oracle.com/resourcemanager/stacks/create?zipUrl=https://github.com/ou-developers/GenAI-RAG-Sandbox-Stack/archive/refs/heads/main.zip)
 
 ### Alternative: Upload Manually
 1. Download the ZIP release asset.
