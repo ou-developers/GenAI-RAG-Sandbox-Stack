@@ -1,5 +1,5 @@
 #!/bin/bash
-# cloudinit.sh — Oracle 23ai Free + GenAI stack bootstrap (merged & hardened)
+# cloudinit.sh — Oracle 23ai Free + GenAI stack bootstrap (merged, hardened, self-healing)
 
 set -Eeuo pipefail
 
@@ -122,7 +122,119 @@ chown -R opc:opc "$CODE_DIR" || true
 chmod -R a+rX "$CODE_DIR" || true
 ln -sfn "$CODE_DIR" /opt/code || true
 
-echo "[STEP] embed user's init-genailabs.sh (no DB start here; DB unit handles it)"
+# --------------------------------------------------------------------
+# Self-healing venv helper (idempotent) + launcher + user service
+# --------------------------------------------------------------------
+echo "[STEP] write genai-ensure-venv.sh"
+cat >/usr/local/bin/genai-ensure-venv.sh <<'ENSURE'
+#!/bin/bash
+set -euo pipefail
+
+VENV="$HOME/.venvs/genai"
+PY=python3.9
+
+# make sure python39 exists
+if ! command -v $PY >/dev/null 2>&1; then
+  sudo dnf -y module enable python39 || true
+  sudo dnf -y install python39 python39-pip
+fi
+
+# create venv if missing
+if [[ ! -f "$VENV/bin/activate" ]]; then
+  mkdir -p "$(dirname "$VENV")"
+  $PY -m venv "$VENV"
+  source "$VENV/bin/activate"
+  python -m pip install --upgrade pip wheel setuptools
+  deactivate
+fi
+
+# ensure JupyterLab present
+source "$VENV/bin/activate"
+python -c "import jupyterlab" 2>/dev/null || pip install --no-cache-dir jupyterlab==4.2.5
+
+# ensure base libs (idempotent; cheap no-ops if already installed)
+pip install --no-cache-dir \
+  streamlit==1.36.0 oracledb sentence-transformers \
+  langchain==0.2.6 langchain-community==0.2.6 langchain-chroma==0.1.2 \
+  langchain-core==0.2.11 langchain-text-splitters==0.2.2 \
+  langsmith==0.1.83 pypdf==4.2.0 python-multipart==0.0.9 \
+  chroma-hnswlib==0.7.3 chromadb==0.5.3 torch==2.5.0 oci oracle-ads
+
+deactivate
+ENSURE
+chmod +x /usr/local/bin/genai-ensure-venv.sh
+
+echo "[STEP] write start_jupyter.sh"
+cat >/home/opc/start_jupyter.sh <<'SH'
+#!/bin/bash
+set -euo pipefail
+export HOME=/home/opc
+
+# always ensure the venv + jupyter exist before starting
+/usr/local/bin/genai-ensure-venv.sh
+
+source "$HOME/.venvs/genai/bin/activate"
+PORT="${PORT:-8888}"
+exec jupyter lab --NotebookApp.token='' --NotebookApp.password='' --ip=0.0.0.0 --port="${PORT}" --no-browser
+SH
+chown opc:opc /home/opc/start_jupyter.sh
+chmod +x /home/opc/start_jupyter.sh
+
+echo "[STEP] create user systemd unit for Jupyter"
+sudo -u opc bash -lc '
+mkdir -p $HOME/.config/systemd/user
+cat > $HOME/.config/systemd/user/jupyter.service <<UNIT
+[Unit]
+Description=JupyterLab (GenAI venv)
+
+[Service]
+Type=simple
+ExecStart=%h/start_jupyter.sh
+Restart=always
+RestartSec=5
+Environment=PORT=8888
+
+[Install]
+WantedBy=default.target
+UNIT
+
+systemctl --user daemon-reload
+systemctl --user enable --now jupyter.service
+'
+# allow user services to keep running after logout
+loginctl enable-linger opc || true
+
+# --------------------------------------------------------------------
+# Seed /opt/genai content & remaining tooling
+# --------------------------------------------------------------------
+echo "[STEP] seed /opt/genai content"
+cat >/opt/genai/LoadProperties.py <<'PY'
+class LoadProperties:
+    def __init__(self):
+        import json
+        with open('config.txt') as f:
+            js = json.load(f)
+        self.model_name = js.get("model_name")
+        self.embedding_model_name = js.get("embedding_model_name")
+        self.endpoint = js.get("endpoint")
+        self.compartment_ocid = js.get("compartment_ocid")
+    def getModelName(self): return self.model_name
+    def getEmbeddingModelName(self): return self.embedding_model_name
+    def getEndpoint(self): return self.endpoint
+    def getCompartment(self): return self.compartment_ocid
+PY
+cat >/opt/genai/config.txt <<'CFG'
+{"model_name":"cohere.command-r-16k","embedding_model_name":"cohere.embed-english-v3.0","endpoint":"https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com","compartment_ocid":"ocid1.compartment.oc1....replace_me..."}
+CFG
+mkdir -p /opt/genai/txt-docs /opt/genai/pdf-docs
+echo "faq | What are Always Free services?=====Always Free services are part of Oracle Cloud Free Tier." >/opt/genai/txt-docs/faq.txt
+chown -R opc:opc /opt/genai
+
+echo "[STEP] ensure Python 3.9 (base) available for venv helper"
+retry 5 dnf -y module enable python39 || true
+retry 5 dnf -y install python39 python39-pip || true
+
+echo "[STEP] run user's init-genailabs.sh (kept; DB waits handled)"
 cat >/opt/genai/init-genailabs.sh <<'USERSCRIPT'
 #!/bin/bash
 set -Eeuo pipefail
@@ -200,24 +312,6 @@ STARTUP;
 EXIT
 EOSQL' || true
 
-# Install a Python 3.9 venv for Jupyter + libs (no labs dir)
-sudo -u opc bash -lc '
-  python3.9 -m venv $HOME/.venvs/genai || true
-  echo "source $HOME/.venvs/genai/bin/activate" >> $HOME/.bashrc
-  source $HOME/.venvs/genai/bin/activate
-  python -m pip install --upgrade pip wheel setuptools
-  pip install --no-cache-dir jupyterlab==4.2.5 streamlit==1.36.0 oracledb sentence-transformers langchain==0.2.6 langchain-community==0.2.6 langchain-chroma==0.1.2 langchain-core==0.2.11 langchain-text-splitters==0.2.2 langsmith==0.1.83 pypdf==4.2.0 python-multipart==0.0.9 chroma-hnswlib==0.7.3 chromadb==0.5.3 torch==2.5.0 oci oracle-ads
-'
-
-# OCI CLI (user-local)
-sudo -u opc bash -lc '
-  curl -sSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o /tmp/oci-install.sh
-  bash /tmp/oci-install.sh --accept-all-defaults --exec-dir $HOME/bin --install-dir $HOME/lib/oci-cli --update-path false
-  grep -q "export PATH=\$HOME/bin" $HOME/.bashrc || echo "export PATH=\$HOME/bin:\$PATH" >> $HOME/.bashrc
-  echo "export PATH=\$PATH:\$HOME/.local/bin" >> $HOME/.bashrc
-  source $HOME/.bashrc
-'
-
 touch "$MARKER_FILE"
 echo "===== Cloud-Init User Script Completed Successfully ====="
 exit 0
@@ -226,48 +320,7 @@ chmod +x /opt/genai/init-genailabs.sh
 cp -f /opt/genai/init-genailabs.sh /home/opc/init-genailabs.sh || true
 chown opc:opc /home/opc/init-genailabs.sh || true
 
-echo "[STEP] install Python 3.9 for OL8 and create venv (base)"
-retry 5 dnf -y module enable python39 || true
-retry 5 dnf -y install python39 python39-pip || true
-
-echo "[STEP] seed /opt/genai content"
-cat >/opt/genai/LoadProperties.py <<'PY'
-class LoadProperties:
-    def __init__(self):
-        import json
-        with open('config.txt') as f:
-            js = json.load(f)
-        self.model_name = js.get("model_name")
-        self.embedding_model_name = js.get("embedding_model_name")
-        self.endpoint = js.get("endpoint")
-        self.compartment_ocid = js.get("compartment_ocid")
-    def getModelName(self): return self.model_name
-    def getEmbeddingModelName(self): return self.embedding_model_name
-    def getEndpoint(self): return self.endpoint
-    def getCompartment(self): return self.compartment_ocid
-PY
-cat >/opt/genai/config.txt <<'CFG'
-{"model_name":"cohere.command-r-16k","embedding_model_name":"cohere.embed-english-v3.0","endpoint":"https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com","compartment_ocid":"ocid1.compartment.oc1....replace_me..."}
-CFG
-mkdir -p /opt/genai/txt-docs /opt/genai/pdf-docs
-echo "faq | What are Always Free services?=====Always Free services are part of Oracle Cloud Free Tier." >/opt/genai/txt-docs/faq.txt
-chown -R opc:opc /opt/genai
-
-echo "[STEP] write start_jupyter.sh"
-cat >/home/opc/start_jupyter.sh <<'SH'
-#!/bin/bash
-set -eux
-source $HOME/.venvs/genai/bin/activate
-jupyter lab --NotebookApp.token='' --NotebookApp.password='' --ip=0.0.0.0 --port=8888 --no-browser
-SH
-chown opc:opc /home/opc/start_jupyter.sh
-chmod +x /home/opc/start_jupyter.sh
-
-echo "[STEP] open firewall ports"
-for p in 8888 8501 1521; do firewall-cmd --zone=public --add-port=${p}/tcp --permanent || true; done
-firewall-cmd --reload || true
-
-echo "[STEP] run user's init-genailabs.sh (non-fatal)"
+# Run it (non-fatal)
 set +e
 bash /opt/genai/init-genailabs.sh
 USR_RC=$?
