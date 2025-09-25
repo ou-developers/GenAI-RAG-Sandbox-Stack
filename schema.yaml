@@ -1,0 +1,26 @@
+title: "OCI One-Click GenAI Stack — v15j"
+schemaVersion: 1.1.0
+variables:
+  tenancy_ocid: { title: "Tenancy OCID", type: string, required: true }
+  home_region:  { title: "Home Region",  type: string, required: true }
+  region:       { title: "Deployment Region", type: string, required: true }
+  ssh_public_key: { title: "SSH Public Key", type: string, required: true }
+  create_compartment: { title: "Create Project Compartment", type: boolean, default: true }
+  parent_compartment_ocid: { title: "Parent Compartment OCID (for new project compartment)", type: string }
+  project_compartment_ocid: { title: "Existing Project Compartment OCID (when not creating)", type: string }
+  compartment_name: { title: "Project Compartment Name", type: string, default: "genai-oneclick-project" }
+  instance_shape: { title: "Instance Shape", type: string, default: "VM.Standard.E5.Flex" }
+  instance_ocpus: { title: "OCPUs", type: number, default: 2 }
+  instance_memory_gbs: { title: "Memory (GB)", type: number, default: 24 }
+  boot_volume_size_gbs: { title: "Boot Volume Size (GB)", type: number, default: 100 }
+  open_tcp_ports_csv: { title: "Open TCP Ports (CSV)", type: string, default: "22,8888,8501,1521" }
+  create_policies: { title: "Create DG + Policies for Generative AI", type: boolean, default: true }
+variableGroups:
+  - title: "Basics"
+    variables: [tenancy_ocid, home_region, region, ssh_public_key]
+  - title: "Compartments"
+    variables: [create_compartment, parent_compartment_ocid, project_compartment_ocid, compartment_name]
+  - title: "Compute"
+    variables: [instance_shape, instance_ocpus, instance_memory_gbs, boot_volume_size_gbs, open_tcp_ports_csv]
+  - title: "IAM"
+    variables: [create_policies]
