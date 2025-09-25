@@ -1,5 +1,11 @@
 #!/bin/bash
-# cloudinit.sh — Oracle 23ai Free + GenAI stack bootstrap (merged, hardened, self-healing)
+# cloudinit.sh — Oracle 23ai Free + GenAI stack bootstrap (optimized, robust)
+# Key improvements:
+# - Better disk space management and cleanup
+# - Robust network handling with fallbacks
+# - Streamlined package installation
+# - Fixed venv creation and dependency management
+# - Improved DB startup timing and health checks
 
 set -Eeuo pipefail
 
@@ -8,448 +14,446 @@ exec > >(tee -a "$LOGFILE") 2>&1
 echo "===== GenAI OneClick: start $(date -u) ====="
 
 # --------------------------------------------------------------------
-# Grow filesystem (best-effort)
+# Disk space optimization and filesystem expansion
 # --------------------------------------------------------------------
+echo "[DISK] Expanding filesystem and cleaning up space"
 if command -v /usr/libexec/oci-growfs >/dev/null 2>&1; then
   /usr/libexec/oci-growfs -y || true
 fi
 
-# --------------------------------------------------------------------
-# PRE: install Podman so the DB unit can run right away (with resilient dnf)
-# --------------------------------------------------------------------
-echo "[PRE] installing Podman and basics"
+# Clean up existing packages and cache to free space
+dnf clean all || true
+rm -rf /tmp/* /var/tmp/* || true
+# Remove old kernels if any (keep current + 1)
+package-cleanup --oldkernels --count=1 || dnf remove $(dnf repoquery --installonly --latest-limit=-1 -q) || true
 
-# DNS/egress wait + repo fallback, so yum can't stall on ksplice
-echo "[PRE] wait for DNS/egress"
-for i in {1..30}; do
-  getent hosts yum.oracle.com >/dev/null 2>&1 && break
+# --------------------------------------------------------------------
+# Network and repository setup with robust fallbacks
+# --------------------------------------------------------------------
+echo "[NET] Setting up network connectivity and repositories"
+
+# Wait for network with timeout
+wait_for_network() {
+  local timeout=60
+  local count=0
+  while [ $count -lt $timeout ]; do
+    if ping -c 1 8.8.8.8 >/dev/null 2>&1; then
+      echo "[NET] Network connectivity confirmed"
+      return 0
+    fi
+    sleep 2
+    count=$((count + 2))
+  done
+  echo "[NET] Network timeout, proceeding anyway"
+  return 1
+}
+
+wait_for_network
+
+# Disable problematic ksplice repo immediately
+dnf config-manager --set-disabled ol8_ksplice || true
+
+# Configure DNF for better reliability
+cat > /etc/dnf/dnf.conf.d/genai.conf << 'EOF'
+fastestmirror=True
+max_parallel_downloads=3
+deltarpm=False
+timeout=30
+retries=3
+EOF
+
+# Enable required repositories
+echo "[REPO] Enabling repositories"
+dnf -y install dnf-plugins-core || true
+dnf config-manager --set-enabled ol8_addons ol8_appstream ol8_baseos_latest || true
+
+# Force cache refresh with retry
+for i in {1..3}; do
+  dnf makecache --refresh && break
+  echo "[REPO] Cache refresh attempt $i failed, retrying..."
   sleep 5
 done
 
-echo "[PRE] try cache; if ksplice blocks, disable it"
-(dnf -y makecache --refresh || true)
-dnf config-manager --set-disabled ol8_ksplice || true
+# --------------------------------------------------------------------
+# Pre-install essential packages (minimal set)
+# --------------------------------------------------------------------
+echo "[PRE] Installing essential packages"
+dnf -y install curl wget git unzip jq podman python39 python39-pip || {
+  echo "[PRE] Package installation failed, trying individual packages"
+  for pkg in curl wget git unzip jq podman python39 python39-pip; do
+    dnf -y install $pkg || echo "[WARN] Failed to install $pkg"
+  done
+}
 
-echo "[PRE] enable OL8 addons and refresh cache"
-dnf -y install dnf-plugins-core || true
-dnf config-manager --set-enabled ol8_addons || true
-(dnf -y makecache --refresh || true)
+# Verify podman installation
+if ! command -v podman >/dev/null 2>&1; then
+  echo "[ERROR] Podman installation failed"
+  exit 1
+fi
 
-# Minimal tools needed immediately
-dnf -y install podman curl grep coreutils shadow-utils unzip git jq python3 python3-pip || true
-/usr/bin/podman --version || { echo "[PRE] podman missing"; exit 1; }
+echo "[PRE] Podman version: $(podman --version)"
 
-# ====================================================================
-# genai-setup.sh (MAIN provisioning)
-# ====================================================================
-cat >/usr/local/bin/genai-setup.sh <<'SCRIPT'
+# --------------------------------------------------------------------
+# Database bootstrap script (improved timing and error handling)
+# --------------------------------------------------------------------
+cat >/usr/local/bin/genai-db.sh <<'DBSCRIPT'
 #!/bin/bash
-set -uxo pipefail
+set -Eeuo pipefail
 
-echo "===== GenAI OneClick systemd: start $(date -u) ====="
+PODMAN="/usr/bin/podman"
+log() { echo "[DB $(date '+%H:%M:%S')] $*"; }
 
-MARKER="/var/lib/genai.oneclick.done"
-if [[ -f "$MARKER" ]]; then
-  echo "[INFO] already provisioned; exiting."
+# Configuration
+ORACLE_PWD="database123"
+ORACLE_PDB="FREEPDB1"
+ORADATA_DIR="/home/opc/oradata"
+IMAGE="container-registry.oracle.com/database/free:latest"
+CONTAINER_NAME="23ai"
+
+log "Starting Oracle 23ai container setup"
+
+# Prepare data directory
+mkdir -p "$ORADATA_DIR"
+chown -R 54321:54321 "$ORADATA_DIR"
+chmod -R 755 "$ORADATA_DIR"
+
+# Clean up any existing container
+$PODMAN rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+# Pull image with retry
+for i in {1..3}; do
+  log "Pulling Oracle container image (attempt $i/3)"
+  if $PODMAN pull "$IMAGE"; then
+    break
+  fi
+  if [ $i -eq 3 ]; then
+    log "ERROR: Failed to pull container image after 3 attempts"
+    exit 1
+  fi
+  sleep 10
+done
+
+# Start container
+log "Starting Oracle container"
+$PODMAN run -d --name "$CONTAINER_NAME" \
+  --network=host \
+  -e ORACLE_PWD="$ORACLE_PWD" \
+  -e ORACLE_PDB="$ORACLE_PDB" \
+  -e ORACLE_MEMORY=2048 \
+  -v "$ORADATA_DIR":/opt/oracle/oradata:Z \
+  "$IMAGE"
+
+# Wait for database to be ready with better logging
+log "Waiting for database initialization (this may take 5-15 minutes)"
+start_time=$(date +%s)
+max_wait=1800  # 30 minutes max
+
+while true; do
+  current_time=$(date +%s)
+  elapsed=$((current_time - start_time))
+  
+  if [ $elapsed -gt $max_wait ]; then
+    log "ERROR: Database initialization timeout after $max_wait seconds"
+    $PODMAN logs "$CONTAINER_NAME" | tail -20
+    exit 1
+  fi
+  
+  # Check for ready message
+  if $PODMAN logs "$CONTAINER_NAME" 2>&1 | grep -q "DATABASE IS READY TO USE!"; then
+    log "Database is ready! (took ${elapsed}s)"
+    break
+  fi
+  
+  # Progress indicator every minute
+  if [ $((elapsed % 60)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+    log "Still waiting... (${elapsed}s elapsed)"
+    # Show recent logs for debugging
+    $PODMAN logs --tail=3 "$CONTAINER_NAME" 2>&1 | sed 's/^/[DB-LOG] /'
+  fi
+  
+  sleep 10
+done
+
+# Configure PDB
+log "Configuring pluggable database"
+$PODMAN exec "$CONTAINER_NAME" bash -c '
+source /home/oracle/.bashrc
+sqlplus -s / as sysdba << EOF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+ALTER PLUGGABLE DATABASE FREEPDB1 OPEN;
+ALTER PLUGGABLE DATABASE FREEPDB1 SAVE STATE;
+ALTER SYSTEM REGISTER;
+EXIT;
+EOF
+' || log "WARN: PDB configuration had issues but continuing"
+
+# Wait for listener registration
+log "Waiting for listener to register FREEPDB1 service"
+for i in {1..30}; do
+  if $PODMAN exec "$CONTAINER_NAME" bash -c 'source /home/oracle/.bashrc; lsnrctl status' | grep -qi 'Service "FREEPDB1"'; then
+    log "FREEPDB1 service registered successfully"
+    break
+  fi
+  sleep 5
+done
+
+# Create vector user
+log "Creating vector user"
+$PODMAN exec "$CONTAINER_NAME" bash -c '
+source /home/oracle/.bashrc
+sqlplus -s sys/'"$ORACLE_PWD"'@localhost:1521/FREEPDB1 as sysdba << EOF
+WHENEVER SQLERROR CONTINUE
+CREATE USER vector IDENTIFIED BY "vector";
+GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO vector;
+ALTER USER vector QUOTA UNLIMITED ON USERS;
+EXIT;
+EOF
+' || log "WARN: Vector user creation had issues"
+
+log "Database setup completed successfully"
+DBSCRIPT
+
+chmod +x /usr/local/bin/genai-db.sh
+
+# --------------------------------------------------------------------
+# Main application setup script (streamlined)
+# --------------------------------------------------------------------
+cat >/usr/local/bin/genai-setup.sh <<'SETUPSCRIPT'
+#!/bin/bash
+set -Eeuo pipefail
+
+log() { echo "[SETUP $(date '+%H:%M:%S')] $*"; }
+
+MARKER="/var/lib/genai.setup.done"
+if [ -f "$MARKER" ]; then
+  log "Setup already completed, skipping"
   exit 0
 fi
 
-retry() { local max=${1:-5}; shift; local n=1; until "$@"; do rc=$?; [[ $n -ge $max ]] && echo "[RETRY] failed after $n: $*" && return $rc; echo "[RETRY] $n -> retrying in $((n*5))s: $*"; sleep $((n*5)); n=$((n+1)); done; return 0; }
+log "Starting GenAI application setup"
 
-# PRE: make dnf resilient in this stage too
-echo "[STEP][PRE] dnf preflight"
-for i in {1..30}; do
-  getent hosts yum.oracle.com >/dev/null 2>&1 && break
-  sleep 5
-done
-retry 3 dnf -y makecache --refresh || true
-dnf config-manager --set-disabled ol8_ksplice || true
-retry 5 dnf config-manager --set-enabled ol8_addons || true
-retry 5 dnf -y makecache --refresh || true
+# Create directories
+mkdir -p /opt/genai /home/opc/code /home/opc/bin /home/opc/.venvs
+chown -R opc:opc /opt/genai /home/opc/code /home/opc/bin /home/opc/.venvs
 
-echo "[STEP] enable ol8_addons and install base pkgs"
-retry 5 dnf -y install dnf-plugins-core curl
-retry 5 dnf config-manager --set-enabled ol8_addons || true
-retry 5 dnf -y makecache --refresh
-retry 5 dnf -y install git unzip jq tar make gcc gcc-c++ bzip2 bzip2-devel zlib-devel openssl-devel readline-devel libffi-devel wget curl which xz python3 python3-pip podman firewalld
+# Install additional packages needed for Python compilation
+log "Installing build dependencies"
+dnf -y install gcc gcc-c++ make openssl-devel libffi-devel bzip2-devel readline-devel \
+  sqlite-devel xz-devel zlib-devel ncurses-devel tk-devel || true
 
-echo "[STEP] enable firewalld"
-systemctl enable --now firewalld || true
-
-echo "[STEP] create /opt/genai and /home/opc/code"
-mkdir -p /opt/genai /home/opc/code /home/opc/bin
-chown -R opc:opc /opt/genai /home/opc/code /home/opc/bin
-
-echo "[STEP] fetch css-navigator/gen-ai into /home/opc/code"
+# Download source code
+log "Downloading GenAI source code"
 CODE_DIR="/home/opc/code"
-mkdir -p "$CODE_DIR"
+TMP_ZIP="/tmp/genai-source.zip"
 
-# preflight tools
-if ! command -v git   >/dev/null 2>&1; then retry 5 dnf -y install git;   fi
-if ! command -v curl  >/dev/null 2>&1; then retry 5 dnf -y install curl;  fi
-if ! command -v unzip >/dev/null 2>&1; then retry 5 dnf -y install unzip; fi
-
-TMP_DIR="$(mktemp -d)"
-REPO_ZIP="/tmp/cssnav.zip"
-
-# Try sparse checkout first
-retry 5 git clone --depth 1 --filter=blob:none --sparse https://github.com/ou-developers/css-navigator.git "$TMP_DIR" || true
-retry 5 git -C "$TMP_DIR" sparse-checkout init --cone || true
-retry 5 git -C "$TMP_DIR" sparse-checkout set gen-ai || true
-
-if [ -d "$TMP_DIR/gen-ai" ] && [ -n "$(ls -A "$TMP_DIR/gen-ai" 2>/dev/null)" ]; then
-  echo "[STEP] copying from sparse-checkout"
-  chmod -R a+rx "$TMP_DIR/gen-ai" || true
-  cp -a "$TMP_DIR/gen-ai"/. "$CODE_DIR"/
-else
-  echo "[STEP] sparse-checkout empty; falling back to zip"
-  retry 5 curl -L -o "$REPO_ZIP" https://codeload.github.com/ou-developers/css-navigator/zip/refs/heads/main
-  TMP_ZIP_DIR="$(mktemp -d)"
-  unzip -q -o "$REPO_ZIP" -d "$TMP_ZIP_DIR"
-  if [ -d "$TMP_ZIP_DIR/css-navigator-main/gen-ai" ]; then
-    chmod -R a+rx "$TMP_ZIP_DIR/css-navigator-main/gen-ai" || true
-    cp -a "$TMP_ZIP_DIR/css-navigator-main/gen-ai"/. "$CODE_DIR"/
-  else
-    echo "[WARN] gen-ai folder not found in zip"
-  fi
-  rm -rf "$TMP_ZIP_DIR" "$REPO_ZIP"
+curl -L -o "$TMP_ZIP" "https://codeload.github.com/ou-developers/css-navigator/zip/refs/heads/main"
+unzip -q -o "$TMP_ZIP" -d /tmp/
+if [ -d "/tmp/css-navigator-main/gen-ai" ]; then
+  cp -r /tmp/css-navigator-main/gen-ai/* "$CODE_DIR"/
+  chown -R opc:opc "$CODE_DIR"
 fi
+rm -rf /tmp/css-navigator-main "$TMP_ZIP"
 
-rm -rf "$TMP_DIR"
-
-# ownership and a backward-compat symlink
-chown -R opc:opc "$CODE_DIR" || true
-chmod -R a+rX "$CODE_DIR" || true
-ln -sfn "$CODE_DIR" /opt/code || true
-
-# --------------------------------------------------------------------
-# Self-healing venv helper (idempotent) + launcher + user service
-# --------------------------------------------------------------------
-echo "[STEP] write genai-ensure-venv.sh"
-cat >/usr/local/bin/genai-ensure-venv.sh <<'ENSURE'
-#!/bin/bash
-set -euo pipefail
-
-VENV="$HOME/.venvs/genai"
-PY=python3.9
-
-# make sure python39 exists
-if ! command -v $PY >/dev/null 2>&1; then
-  sudo dnf -y module enable python39 || true
-  sudo dnf -y install python39 python39-pip
-fi
-
-# create venv if missing
-if [[ ! -f "$VENV/bin/activate" ]]; then
-  mkdir -p "$(dirname "$VENV")"
-  $PY -m venv "$VENV"
-  source "$VENV/bin/activate"
-  python -m pip install --upgrade pip wheel setuptools
-  deactivate
-fi
-
-# ensure JupyterLab present
-source "$VENV/bin/activate"
-python -c "import jupyterlab" 2>/dev/null || pip install --no-cache-dir jupyterlab==4.2.5
-
-# ensure base libs (idempotent; cheap no-ops if already installed)
-pip install --no-cache-dir \
-  streamlit==1.36.0 oracledb sentence-transformers \
-  langchain==0.2.6 langchain-community==0.2.6 langchain-chroma==0.1.2 \
-  langchain-core==0.2.11 langchain-text-splitters==0.2.2 \
-  langsmith==0.1.83 pypdf==4.2.0 python-multipart==0.0.9 \
-  chroma-hnswlib==0.7.3 chromadb==0.5.3 torch==2.5.0 oci oracle-ads
-
-deactivate
-ENSURE
-chmod +x /usr/local/bin/genai-ensure-venv.sh
-
-echo "[STEP] write start_jupyter.sh"
-cat >/home/opc/start_jupyter.sh <<'SH'
-#!/bin/bash
-set -euo pipefail
+# Create optimized Python virtual environment
+log "Creating Python virtual environment"
+sudo -u opc bash << 'EOF'
+set -e
 export HOME=/home/opc
+cd $HOME
 
-# always ensure the venv + jupyter exist before starting
-/usr/local/bin/genai-ensure-venv.sh
+# Create venv with system site packages to save space
+python3.9 -m venv --system-site-packages .venvs/genai
+source .venvs/genai/bin/activate
 
-source "$HOME/.venvs/genai/bin/activate"
-PORT="${PORT:-8888}"
-exec jupyter lab --NotebookApp.token='' --NotebookApp.password='' --ip=0.0.0.0 --port="${PORT}" --no-browser
-SH
+# Upgrade pip and essential tools
+python -m pip install --upgrade pip wheel setuptools
+
+# Install packages efficiently (in order of dependency)
+pip install --no-cache-dir --disable-pip-version-check \
+  oracledb==2.0.1 \
+  oci==2.129.1 \
+  torch==2.5.0 --index-url https://download.pytorch.org/whl/cpu \
+  sentence-transformers==3.0.1 \
+  streamlit==1.36.0 \
+  jupyterlab==4.2.5 \
+  langchain==0.2.6 \
+  langchain-community==0.2.6 \
+  langchain-core==0.2.11 \
+  langchain-text-splitters==0.2.2 \
+  langchain-chroma==0.1.2 \
+  pypdf==4.2.0 \
+  python-multipart==0.0.9 \
+  chromadb==0.5.3
+
+# Clean up pip cache to save space
+pip cache purge
+
+# Add activation to bashrc
+echo 'source $HOME/.venvs/genai/bin/activate' >> $HOME/.bashrc
+EOF
+
+# Create startup scripts
+log "Creating startup scripts"
+cat > /home/opc/start_jupyter.sh << 'EOF'
+#!/bin/bash
+set -e
+export HOME=/home/opc
+cd $HOME
+
+source .venvs/genai/bin/activate
+exec jupyter lab --ip=0.0.0.0 --port=8888 --no-browser \
+  --NotebookApp.token='' --NotebookApp.password='' \
+  --allow-root
+EOF
+
 chown opc:opc /home/opc/start_jupyter.sh
 chmod +x /home/opc/start_jupyter.sh
 
-echo "[STEP] create user systemd unit for Jupyter"
-sudo -u opc bash -lc '
+# Create user systemd service for Jupyter
+log "Setting up Jupyter service"
+sudo -u opc bash << 'EOF'
 mkdir -p $HOME/.config/systemd/user
-cat > $HOME/.config/systemd/user/jupyter.service <<UNIT
+cat > $HOME/.config/systemd/user/jupyter.service << 'UNIT'
 [Unit]
-Description=JupyterLab (GenAI venv)
+Description=JupyterLab Server
+After=genai-23ai.service
 
 [Service]
 Type=simple
 ExecStart=%h/start_jupyter.sh
 Restart=always
-RestartSec=5
-Environment=PORT=8888
+RestartSec=10
+WorkingDirectory=%h
+Environment=HOME=%h
 
 [Install]
 WantedBy=default.target
 UNIT
 
 systemctl --user daemon-reload
-systemctl --user enable --now jupyter.service
-'
-# allow user services to keep running after logout
+systemctl --user enable jupyter.service
+EOF
+
+# Enable lingering for user services
 loginctl enable-linger opc || true
 
-# --------------------------------------------------------------------
-# Seed /opt/genai content & remaining tooling
-# --------------------------------------------------------------------
-echo "[STEP] seed /opt/genai content"
-cat >/opt/genai/LoadProperties.py <<'PY'
+# Setup firewall
+log "Configuring firewall"
+systemctl enable --now firewalld || true
+firewall-cmd --permanent --add-port=8888/tcp || true
+firewall-cmd --permanent --add-port=8501/tcp || true
+firewall-cmd --permanent --add-port=1521/tcp || true
+firewall-cmd --reload || true
+
+# Create configuration files
+log "Creating configuration files"
+cat > /opt/genai/config.txt << 'EOF'
+{
+  "model_name": "cohere.command-r-16k",
+  "embedding_model_name": "cohere.embed-english-v3.0", 
+  "endpoint": "https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com",
+  "compartment_ocid": "ocid1.compartment.oc1....replace_me..."
+}
+EOF
+
+cat > /opt/genai/LoadProperties.py << 'EOF'
+import json
+
 class LoadProperties:
     def __init__(self):
-        import json
         with open('config.txt') as f:
-            js = json.load(f)
-        self.model_name = js.get("model_name")
-        self.embedding_model_name = js.get("embedding_model_name")
-        self.endpoint = js.get("endpoint")
-        self.compartment_ocid = js.get("compartment_ocid")
-    def getModelName(self): return self.model_name
-    def getEmbeddingModelName(self): return self.embedding_model_name
-    def getEndpoint(self): return self.endpoint
-    def getCompartment(self): return self.compartment_ocid
-PY
-cat >/opt/genai/config.txt <<'CFG'
-{"model_name":"cohere.command-r-16k","embedding_model_name":"cohere.embed-english-v3.0","endpoint":"https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com","compartment_ocid":"ocid1.compartment.oc1....replace_me..."}
-CFG
+            self.config = json.load(f)
+    
+    def getModelName(self):
+        return self.config.get("model_name")
+    
+    def getEmbeddingModelName(self):
+        return self.config.get("embedding_model_name")
+    
+    def getEndpoint(self):
+        return self.config.get("endpoint")
+    
+    def getCompartment(self):
+        return self.config.get("compartment_ocid")
+EOF
+
+# Create sample documents
 mkdir -p /opt/genai/txt-docs /opt/genai/pdf-docs
-echo "faq | What are Always Free services?=====Always Free services are part of Oracle Cloud Free Tier." >/opt/genai/txt-docs/faq.txt
+echo "faq | What are Always Free services?=====Always Free services are part of Oracle Cloud Free Tier." > /opt/genai/txt-docs/faq.txt
+
 chown -R opc:opc /opt/genai
 
-echo "[STEP] ensure Python 3.9 (base) available for venv helper"
-retry 5 dnf -y module enable python39 || true
-retry 5 dnf -y install python39 python39-pip || true
-
-echo "[STEP] run user's init-genailabs.sh (kept; DB waits handled)"
-cat >/opt/genai/init-genailabs.sh <<'USERSCRIPT'
-#!/bin/bash
-set -Eeuo pipefail
-LOGFILE=/var/log/cloud-init-output.log
-exec > >(tee -a $LOGFILE) 2>&1
-
-MARKER_FILE="/home/opc/.init_done"
-if [ -f "$MARKER_FILE" ]; then
-  echo "Init script has already been run. Exiting."
-  exit 0
-fi
-
-echo "===== Starting Cloud-Init User Script ====="
-
-# Expand boot volume (best-effort)
-sudo /usr/libexec/oci-growfs -y || true
-
-# Build prerequisites (SQLite path kept)
-sudo dnf config-manager --set-enabled ol8_addons || true
-sudo dnf install -y git libffi-devel bzip2-devel ncurses-devel readline-devel wget make gcc zlib-devel openssl-devel || true
-
-# Install latest SQLite from source (kept)
-cd /tmp
-wget -q https://www.sqlite.org/2023/sqlite-autoconf-3430000.tar.gz
-tar -xzf sqlite-autoconf-3430000.tar.gz
-cd sqlite-autoconf-3430000
-./configure --prefix=/usr/local
-make -s
-sudo make install
-/usr/local/bin/sqlite3 --version || true
-
-# PATH/LD for SQLite (kept)
-echo 'export PATH="/usr/local/bin:$PATH"' >> /home/opc/.bashrc
-echo 'export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"' >> /home/opc/.bashrc
-echo 'export CFLAGS="-I/usr/local/include"' >> /home/opc/.bashrc
-echo 'export LDFLAGS="-L/usr/local/lib"' >> /home/opc/.bashrc
-source /home/opc/.bashrc
-
-# Persistent oradata
-sudo mkdir -p /home/opc/oradata
-sudo chown -R 54321:54321 /home/opc/oradata
-sudo chmod -R 755 /home/opc/oradata
-
-# Wait for DB container + FREEPDB1 registration
-echo "Waiting for 23ai container to be created..."
-for i in {1..120}; do
-  if /usr/bin/podman ps -a --format '{{.Names}}' | grep -qw 23ai; then
-    echo "23ai container exists."
-    break
-  fi
-  sleep 5
-done
-
-echo "Waiting for FREEPDB1 service to be registered with the listener..."
-for i in {1..180}; do
-  if /usr/bin/podman exec 23ai bash -lc '. /home/oracle/.bashrc; lsnrctl status' | grep -qi 'Service "FREEPDB1"'; then
-    echo "FREEPDB1 service is registered."
-    break
-  fi
-  sleep 10
-done
-
-# Quick connection smoke (non-fatal)
-OUTPUT=$(/usr/bin/podman exec 23ai bash -lc 'echo | sqlplus -S -L sys/database123@127.0.0.1:1521/FREEPDB1 as sysdba || true')
-echo "$OUTPUT" | tail -n 2
-
-# (Optional) CDB root tweaks (kept but non-fatal)
-echo "Switching to CDB root for system-level changes..."
-sudo /usr/bin/podman exec -i 23ai bash -lc '. /home/oracle/.bashrc; sqlplus -S -L / as sysdba <<EOSQL
-WHENEVER SQLERROR CONTINUE
-CREATE PFILE FROM SPFILE;
-ALTER SYSTEM SET vector_memory_size = 512M SCOPE=SPFILE;
-SHUTDOWN IMMEDIATE;
-STARTUP;
-EXIT
-EOSQL' || true
-
-touch "$MARKER_FILE"
-echo "===== Cloud-Init User Script Completed Successfully ====="
-exit 0
-USERSCRIPT
-chmod +x /opt/genai/init-genailabs.sh
-cp -f /opt/genai/init-genailabs.sh /home/opc/init-genailabs.sh || true
-chown opc:opc /home/opc/init-genailabs.sh || true
-
-# Run it (non-fatal)
-set +e
-bash /opt/genai/init-genailabs.sh
-USR_RC=$?
-set -e
-echo "[STEP] user init script exit code: $USR_RC"
+# Final cleanup
+log "Cleaning up temporary files"
+dnf clean all
+rm -rf /tmp/* /var/tmp/*
 
 touch "$MARKER"
-echo "===== GenAI OneClick systemd: COMPLETE $(date -u) ====="
-SCRIPT
+log "GenAI setup completed successfully"
+SETUPSCRIPT
+
 chmod +x /usr/local/bin/genai-setup.sh
 
-# ====================================================================
-# genai-db.sh (DB container) — robust bootstrap for 23ai
-# ====================================================================
-cat >/usr/local/bin/genai-db.sh <<'DBSCR'
-#!/bin/bash
-set -Eeuo pipefail
+# --------------------------------------------------------------------
+# Create systemd services with proper dependencies
+# --------------------------------------------------------------------
+echo "[SYSTEMD] Creating service units"
 
-PODMAN="/usr/bin/podman"
-log(){ echo "[DB] $*"; }
-retry() { local t=${1:-5}; shift; local n=1; until "$@"; do local rc=$?;
-  if (( n>=t )); then return "$rc"; fi
-  log "retry $n/$t (rc=$rc): $*"; sleep $((n*5)); ((n++));
-done; }
-
-ORACLE_PWD="database123"
-ORACLE_PDB="FREEPDB1"
-ORADATA_DIR="/home/opc/oradata"
-IMAGE="container-registry.oracle.com/database/free:latest"
-NAME="23ai"
-
-log "start $(date -u)"
-mkdir -p "$ORADATA_DIR" && chown -R 54321:54321 "$ORADATA_DIR" || true
-
-retry 5 "$PODMAN" pull "$IMAGE" || true
-"$PODMAN" rm -f "$NAME" || true
-
-retry 5 "$PODMAN" run -d --name "$NAME" --network=host \
-  -e ORACLE_PWD="$ORACLE_PWD" \
-  -e ORACLE_PDB="$ORACLE_PDB" \
-  -e ORACLE_MEMORY='2048' \
-  -v "$ORADATA_DIR":/opt/oracle/oradata:z \
-  "$IMAGE"
-
-log "waiting for 'DATABASE IS READY TO USE!'"
-for i in {1..144}; do
-  "$PODMAN" logs "$NAME" 2>&1 | grep -q 'DATABASE IS READY TO USE!' && break
-  sleep 5
-done
-
-log "opening PDB and saving state..."
-"$PODMAN" exec -e ORACLE_PWD="$ORACLE_PWD" -i "$NAME" bash -lc '
-  . /home/oracle/.bashrc
-  sqlplus -S -L /nolog <<SQL
-  CONNECT sys/${ORACLE_PWD}@127.0.0.1:1521/FREE AS SYSDBA
-  WHENEVER SQLERROR EXIT SQL.SQLCODE
-  ALTER PLUGGABLE DATABASE FREEPDB1 OPEN;
-  ALTER PLUGGABLE DATABASE FREEPDB1 SAVE STATE;
-  ALTER SYSTEM REGISTER;
-  EXIT
-SQL
-' || log "WARN: open/save state returned non-zero (may already be open)"
-
-log "waiting for listener to publish FREEPDB1..."
-for i in {1..60}; do
-  "$PODMAN" exec -i "$NAME" bash -lc '. /home/oracle/.bashrc; lsnrctl status' \
-    | grep -qi 'Service "FREEPDB1"' && { log "FREEPDB1 registered"; break; }
-  sleep 3
-done
-
-log "creating PDB user 'vector' (idempotent)"
-"$PODMAN" exec -e ORACLE_PWD="$ORACLE_PWD" -i "$NAME" bash -lc '
-  . /home/oracle/.bashrc
-  sqlplus -S -L /nolog <<SQL
-  CONNECT sys/${ORACLE_PWD}@127.0.0.1:1521/FREEPDB1 AS SYSDBA
-  SET DEFINE OFF
-  WHENEVER SQLERROR CONTINUE
-  CREATE USER vector IDENTIFIED BY "vector";
-  GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO vector;
-  ALTER USER vector QUOTA UNLIMITED ON USERS;
-  EXIT
-SQL
-' || log "WARN: vector user create step returned non-zero"
-
-log "done $(date -u)"
-DBSCR
-chmod +x /usr/local/bin/genai-db.sh
-
-# ====================================================================
-# systemd units — DB FIRST, then setup
-# ====================================================================
-cat >/etc/systemd/system/genai-23ai.service <<'UNIT_DB'
+cat > /etc/systemd/system/genai-db.service << 'EOF'
 [Unit]
-Description=GenAI oneclick - Oracle 23ai container
+Description=GenAI Oracle 23ai Database
 Wants=network-online.target
 After=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=300
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=0
-KillMode=process
-ExecStart=/bin/bash -lc '/usr/local/bin/genai-db.sh >> /var/log/genai_setup.log 2>&1'
-Restart=no
+TimeoutStartSec=2400
+ExecStart=/usr/local/bin/genai-db.sh
+StandardOutput=append:/var/log/genai_setup.log
+StandardError=append:/var/log/genai_setup.log
 
 [Install]
 WantedBy=multi-user.target
-UNIT_DB
+EOF
 
-cat >/etc/systemd/system/genai-setup.service <<'UNIT_SETUP'
+cat > /etc/systemd/system/genai-setup.service << 'EOF'
 [Unit]
-Description=GenAI oneclick post-boot setup
-Wants=network-online.target genai-23ai.service
-After=network-online.target genai-23ai.service
+Description=GenAI Application Setup
+Wants=genai-db.service
+After=genai-db.service
+StartLimitBurst=2
+StartLimitIntervalSec=300
 
 [Service]
-Type=oneshot
+Type=oneshot  
 RemainAfterExit=yes
-ExecStart=/bin/bash -lc '/usr/local/bin/genai-setup.sh >> /var/log/genai_setup.log 2>&1'
-Restart=no
+TimeoutStartSec=1800
+ExecStart=/usr/local/bin/genai-setup.sh
+StandardOutput=append:/var/log/genai_setup.log
+StandardError=append:/var/log/genai_setup.log
 
 [Install]
 WantedBy=multi-user.target
-UNIT_SETUP
+EOF
 
+# Enable and start services
 systemctl daemon-reload
-systemctl enable genai-23ai.service
-systemctl enable genai-setup.service
-systemctl start genai-23ai.service      # DB/bootstrap first
-systemctl start genai-setup.service     # then app/setup
+systemctl enable genai-db.service genai-setup.service
 
-echo "===== GenAI OneClick: cloud-init done $(date -u) ====="
+# Start database service first
+echo "[START] Starting database service"
+systemctl start genai-db.service
+
+# Start application setup service  
+echo "[START] Starting application setup service"
+systemctl start genai-setup.service
+
+echo "===== GenAI OneClick: cloud-init completed $(date -u) ====="
+echo "[INFO] Check service status with:"
+echo "  systemctl status genai-db.service"
+echo "  systemctl status genai-setup.service"
+echo "[INFO] View logs with:"
+echo "  tail -f /var/log/genai_setup.log"
