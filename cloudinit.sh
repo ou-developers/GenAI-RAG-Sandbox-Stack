@@ -1,11 +1,5 @@
 #!/bin/bash
-# cloudinit.sh — Oracle 23ai Free + GenAI stack bootstrap (merged)
-# - Keeps ALL prior provisioning (code/, start_jupyter.sh, OCI CLI, pyenv, etc.)
-# - Installs Podman first so DB unit can run
-# - DB unit runs FIRST; setup unit runs AFTER DB
-# - Robust DB bootstrap: open FREEPDB1, SAVE STATE, wait for listener
-# - Idempotent creation of PDB user vector/vector
-# - Hardcoded ORACLE_PWD=database123 (as requested)
+# cloudinit.sh — Oracle 23ai Free + GenAI stack bootstrap (merged & hardened)
 
 set -Eeuo pipefail
 
@@ -21,17 +15,32 @@ if command -v /usr/libexec/oci-growfs >/dev/null 2>&1; then
 fi
 
 # --------------------------------------------------------------------
-# PRE: install Podman so the DB unit can run right away
+# PRE: install Podman so the DB unit can run right away (with resilient dnf)
 # --------------------------------------------------------------------
 echo "[PRE] installing Podman and basics"
+
+# DNS/egress wait + repo fallback, so yum can't stall on ksplice
+echo "[PRE] wait for DNS/egress"
+for i in {1..30}; do
+  getent hosts yum.oracle.com >/dev/null 2>&1 && break
+  sleep 5
+done
+
+echo "[PRE] try cache; if ksplice blocks, disable it"
+(dnf -y makecache --refresh || true)
+dnf config-manager --set-disabled ol8_ksplice || true
+
+echo "[PRE] enable OL8 addons and refresh cache"
 dnf -y install dnf-plugins-core || true
 dnf config-manager --set-enabled ol8_addons || true
-dnf -y makecache --refresh || true
-dnf -y install podman curl grep coreutils shadow-utils || true
+(dnf -y makecache --refresh || true)
+
+# Minimal tools needed immediately
+dnf -y install podman curl grep coreutils shadow-utils unzip git jq python3 python3-pip || true
 /usr/bin/podman --version || { echo "[PRE] podman missing"; exit 1; }
 
 # ====================================================================
-# genai-setup.sh (MAIN provisioning) — kept from your original, with small fixes
+# genai-setup.sh (MAIN provisioning)
 # ====================================================================
 cat >/usr/local/bin/genai-setup.sh <<'SCRIPT'
 #!/bin/bash
@@ -47,13 +56,22 @@ fi
 
 retry() { local max=${1:-5}; shift; local n=1; until "$@"; do rc=$?; [[ $n -ge $max ]] && echo "[RETRY] failed after $n: $*" && return $rc; echo "[RETRY] $n -> retrying in $((n*5))s: $*"; sleep $((n*5)); n=$((n+1)); done; return 0; }
 
-echo "[STEP] enable ol8_addons, pre-populate metadata, and install base pkgs"
+# PRE: make dnf resilient in this stage too
+echo "[STEP][PRE] dnf preflight"
+for i in {1..30}; do
+  getent hosts yum.oracle.com >/dev/null 2>&1 && break
+  sleep 5
+done
+retry 3 dnf -y makecache --refresh || true
+dnf config-manager --set-disabled ol8_ksplice || true
+retry 5 dnf config-manager --set-enabled ol8_addons || true
+retry 5 dnf -y makecache --refresh || true
+
+echo "[STEP] enable ol8_addons and install base pkgs"
 retry 5 dnf -y install dnf-plugins-core curl
 retry 5 dnf config-manager --set-enabled ol8_addons || true
 retry 5 dnf -y makecache --refresh
-retry 5 dnf -y install \
-  git unzip jq tar make gcc gcc-c++ bzip2 bzip2-devel zlib-devel openssl-devel readline-devel libffi-devel \
-  wget curl which xz python3 python3-pip podman firewalld
+retry 5 dnf -y install git unzip jq tar make gcc gcc-c++ bzip2 bzip2-devel zlib-devel openssl-devel readline-devel libffi-devel wget curl which xz python3 python3-pip podman firewalld
 
 echo "[STEP] enable firewalld"
 systemctl enable --now firewalld || true
@@ -62,11 +80,11 @@ echo "[STEP] create /opt/genai and /home/opc/code"
 mkdir -p /opt/genai /home/opc/code /home/opc/bin
 chown -R opc:opc /opt/genai /home/opc/code /home/opc/bin
 
-echo "[STEP] create /home/opc/code and fetch css-navigator/gen-ai"
+echo "[STEP] fetch css-navigator/gen-ai into /home/opc/code"
 CODE_DIR="/home/opc/code"
 mkdir -p "$CODE_DIR"
 
-# preflight
+# preflight tools
 if ! command -v git   >/dev/null 2>&1; then retry 5 dnf -y install git;   fi
 if ! command -v curl  >/dev/null 2>&1; then retry 5 dnf -y install curl;  fi
 if ! command -v unzip >/dev/null 2>&1; then retry 5 dnf -y install unzip; fi
@@ -74,7 +92,7 @@ if ! command -v unzip >/dev/null 2>&1; then retry 5 dnf -y install unzip; fi
 TMP_DIR="$(mktemp -d)"
 REPO_ZIP="/tmp/cssnav.zip"
 
-# Try sparse checkout
+# Try sparse checkout first
 retry 5 git clone --depth 1 --filter=blob:none --sparse https://github.com/ou-developers/css-navigator.git "$TMP_DIR" || true
 retry 5 git -C "$TMP_DIR" sparse-checkout init --cone || true
 retry 5 git -C "$TMP_DIR" sparse-checkout set gen-ai || true
@@ -104,7 +122,7 @@ chown -R opc:opc "$CODE_DIR" || true
 chmod -R a+rX "$CODE_DIR" || true
 ln -sfn "$CODE_DIR" /opt/code || true
 
-echo "[STEP] embed user's init-genailabs.sh (modified to NOT start DB; it waits for it)"
+echo "[STEP] embed user's init-genailabs.sh (no DB start here; DB unit handles it)"
 cat >/opt/genai/init-genailabs.sh <<'USERSCRIPT'
 #!/bin/bash
 set -Eeuo pipefail
@@ -119,14 +137,14 @@ fi
 
 echo "===== Starting Cloud-Init User Script ====="
 
-# Expand the boot volume (best-effort)
+# Expand boot volume (best-effort)
 sudo /usr/libexec/oci-growfs -y || true
 
-# Ensure build prerequisites (SQLite-from-source path kept)
+# Build prerequisites (SQLite path kept)
 sudo dnf config-manager --set-enabled ol8_addons || true
-sudo dnf install -y podman git libffi-devel bzip2-devel ncurses-devel readline-devel wget make gcc zlib-devel openssl-devel || true
+sudo dnf install -y git libffi-devel bzip2-devel ncurses-devel readline-devel wget make gcc zlib-devel openssl-devel || true
 
-# Install latest SQLite from source (kept from original)
+# Install latest SQLite from source (kept)
 cd /tmp
 wget -q https://www.sqlite.org/2023/sqlite-autoconf-3430000.tar.gz
 tar -xzf sqlite-autoconf-3430000.tar.gz
@@ -134,8 +152,6 @@ cd sqlite-autoconf-3430000
 ./configure --prefix=/usr/local
 make -s
 sudo make install
-
-# Verify SQLite
 /usr/local/bin/sqlite3 --version || true
 
 # PATH/LD for SQLite (kept)
@@ -150,8 +166,7 @@ sudo mkdir -p /home/opc/oradata
 sudo chown -R 54321:54321 /home/opc/oradata
 sudo chmod -R 755 /home/opc/oradata
 
-# >>> Modified: DO NOT start the DB here. The systemd DB unit owns it. <<<
-# Wait for 23ai container to exist, then for FREEPDB1 service
+# Wait for DB container + FREEPDB1 registration
 echo "Waiting for 23ai container to be created..."
 for i in {1..120}; do
   if /usr/bin/podman ps -a --format '{{.Names}}' | grep -qw 23ai; then
@@ -174,20 +189,7 @@ done
 OUTPUT=$(/usr/bin/podman exec 23ai bash -lc 'echo | sqlplus -S -L sys/database123@127.0.0.1:1521/FREEPDB1 as sysdba || true')
 echo "$OUTPUT" | tail -n 2
 
-# PDB config (kept, but guarded)
-echo "Configuring Oracle database in PDB (FREEPDB1)..."
-sudo /usr/bin/podman exec -i 23ai bash -lc '. /home/oracle/.bashrc; sqlplus -S -L "sys:database123@127.0.0.1:1521/FREEPDB1 as sysdba" <<EOSQL
-WHENEVER SQLERROR CONTINUE
-CREATE BIGFILE TABLESPACE tbs2 DATAFILE ''bigtbs_f2.dbf'' SIZE 1G AUTOEXTEND ON NEXT 32M MAXSIZE UNLIMITED EXTENT MANAGEMENT LOCAL SEGMENT SPACE MANAGEMENT AUTO;
-CREATE UNDO TABLESPACE undots2 DATAFILE ''undotbs_2a.dbf'' SIZE 1G AUTOEXTEND ON RETENTION GUARANTEE;
-CREATE TEMPORARY TABLESPACE temp_demo TEMPFILE ''temp02.dbf'' SIZE 1G REUSE AUTOEXTEND ON NEXT 32M MAXSIZE UNLIMITED EXTENT MANAGEMENT LOCAL UNIFORM SIZE 1M;
--- Ensure vector exists with defaults (tbs2), idempotent
-CREATE USER vector IDENTIFIED BY "vector" DEFAULT TABLESPACE tbs2 QUOTA UNLIMITED ON tbs2;
-GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO vector;
-EXIT
-EOSQL'
-
-# CDB root tweaks (kept, but non-fatal)
+# (Optional) CDB root tweaks (kept but non-fatal)
 echo "Switching to CDB root for system-level changes..."
 sudo /usr/bin/podman exec -i 23ai bash -lc '. /home/oracle/.bashrc; sqlplus -S -L / as sysdba <<EOSQL
 WHENEVER SQLERROR CONTINUE
@@ -196,66 +198,25 @@ ALTER SYSTEM SET vector_memory_size = 512M SCOPE=SPFILE;
 SHUTDOWN IMMEDIATE;
 STARTUP;
 EXIT
-EOSQL'
+EOSQL' || true
 
-# pyenv + Python 3.11.9 (kept)
-sudo -u opc -i bash <<'EOF_OPC'
-set -eux
-export HOME=/home/opc
-export PYENV_ROOT="$HOME/.pyenv"
-curl -sS https://pyenv.run | bash
+# Install a Python 3.9 venv for Jupyter + libs (no labs dir)
+sudo -u opc bash -lc '
+  python3.9 -m venv $HOME/.venvs/genai || true
+  echo "source $HOME/.venvs/genai/bin/activate" >> $HOME/.bashrc
+  source $HOME/.venvs/genai/bin/activate
+  python -m pip install --upgrade pip wheel setuptools
+  pip install --no-cache-dir jupyterlab==4.2.5 streamlit==1.36.0 oracledb sentence-transformers langchain==0.2.6 langchain-community==0.2.6 langchain-chroma==0.1.2 langchain-core==0.2.11 langchain-text-splitters==0.2.2 langsmith==0.1.83 pypdf==4.2.0 python-multipart==0.0.9 chroma-hnswlib==0.7.3 chromadb==0.5.3 torch==2.5.0 oci oracle-ads
+'
 
-cat << EOF >> $HOME/.bashrc
-export PYENV_ROOT="\$HOME/.pyenv"
-[[ -d "\$PYENV_ROOT/bin" ]] && export PATH="\$PYENV_ROOT/bin:\$PATH"
-eval "\$(pyenv init --path)"
-eval "\$(pyenv init -)"
-eval "\$(pyenv virtualenv-init -)"
-EOF
-
-cat << EOF >> $HOME/.bash_profile
-if [ -f ~/.bashrc ]; then
-   source ~/.bashrc
-fi
-EOF
-
-source $HOME/.bashrc
-export PATH="$PYENV_ROOT/bin:$PATH"
-
-CFLAGS="-I/usr/local/include" LDFLAGS="-L/usr/local/lib" LD_LIBRARY_PATH="/usr/local/lib" pyenv install -s 3.11.9
-pyenv rehash
-mkdir -p $HOME/labs
-cd $HOME/labs
-pyenv local 3.11.9
-pyenv rehash
-python --version
-export PYTHONPATH=$HOME/.pyenv/versions/3.11.9/lib/python3.11/site-packages:$PYTHONPATH
-
-$HOME/.pyenv/versions/3.11.9/bin/pip install --no-cache-dir oci==2.129.1 oracledb sentence-transformers langchain==0.2.6 langchain-community==0.2.6 langchain-chroma==0.1.2 langchain-core==0.2.11 langchain-text-splitters==0.2.2 langsmith==0.1.83 pypdf==4.2.0 streamlit==1.36.0 python-multipart==0.0.9 chroma-hnswlib==0.7.3 chromadb==0.5.3 torch==2.5.0
-
-python - <<PY
-from sentence_transformers import SentenceTransformer
-SentenceTransformer('all-MiniLM-L12-v2')
-PY
-
-pip install --user jupyterlab
-curl -sSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
-chmod +x install.sh
-./install.sh --accept-all-defaults
-echo 'export PATH=$PATH:$HOME/.local/bin' >> $HOME/.bashrc
-source $HOME/.bashrc
-
-REPO_URL="https://github.com/ou-developers/ou-generativeai-pro.git"
-FINAL_DIR="$HOME/labs"
-git init
-git remote add origin $REPO_URL
-git config core.sparseCheckout true
-echo "labs/*" >> .git/info/sparse-checkout
-git pull origin main || true
-mv labs/* . 2>/dev/null || true
-rm -rf .git labs
-echo "Files successfully downloaded to $FINAL_DIR"
-EOF_OPC
+# OCI CLI (user-local)
+sudo -u opc bash -lc '
+  curl -sSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o /tmp/oci-install.sh
+  bash /tmp/oci-install.sh --accept-all-defaults --exec-dir $HOME/bin --install-dir $HOME/lib/oci-cli --update-path false
+  grep -q "export PATH=\$HOME/bin" $HOME/.bashrc || echo "export PATH=\$HOME/bin:\$PATH" >> $HOME/.bashrc
+  echo "export PATH=\$PATH:\$HOME/.local/bin" >> $HOME/.bashrc
+  source $HOME/.bashrc
+'
 
 touch "$MARKER_FILE"
 echo "===== Cloud-Init User Script Completed Successfully ====="
@@ -265,18 +226,9 @@ chmod +x /opt/genai/init-genailabs.sh
 cp -f /opt/genai/init-genailabs.sh /home/opc/init-genailabs.sh || true
 chown opc:opc /home/opc/init-genailabs.sh || true
 
-echo "[STEP] install Python 3.9 for OL8 and create venv"
+echo "[STEP] install Python 3.9 for OL8 and create venv (base)"
 retry 5 dnf -y module enable python39 || true
-retry 5 dnf -y install python39 python39-pip
-sudo -u opc bash -lc 'python3.9 -m venv $HOME/.venvs/genai || true; echo "source $HOME/.venvs/genai/bin/activate" >> $HOME/.bashrc; source $HOME/.venvs/genai/bin/activate; python -m pip install --upgrade pip wheel setuptools'
-echo "[STEP] install Python libraries"
-sudo -u opc bash -lc 'source $HOME/.venvs/genai/bin/activate; pip install --no-cache-dir jupyterlab==4.2.5 streamlit==1.36.0 oracledb sentence-transformers langchain==0.2.6 langchain-community==0.2.6 langchain-core==0.2.11 langchain-text-splitters==0.2.2 langsmith==0.1.83 pypdf==4.2.0 python-multipart==0.0.9 chroma-hnswlib==0.7.3 chromadb==0.5.3 torch==2.5.0 oci oracle-ads'
-
-echo "[STEP] install OCI CLI to ~/bin/oci and make PATH global"
-sudo -u opc bash -lc 'retry 5 curl -sSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o /tmp/oci-install.sh; retry 5 bash /tmp/oci-install.sh --accept-all-defaults --exec-dir $HOME/bin --install-dir $HOME/lib/oci-cli --update-path false; grep -q "export PATH=$HOME/bin" $HOME/.bashrc || echo "export PATH=$HOME/bin:$PATH" >> $HOME/.bashrc'
-cat >/etc/profile.d/genai-path.sh <<'PROF'
-export PATH=/home/opc/bin:$PATH
-PROF
+retry 5 dnf -y install python39 python39-pip || true
 
 echo "[STEP] seed /opt/genai content"
 cat >/opt/genai/LoadProperties.py <<'PY'
